@@ -8,6 +8,7 @@ warnings.filterwarnings("ignore")
 
 st.set_page_config(page_title="Pro Swing Analyzer", layout="wide")
 
+# CSS to kill scrollbars and force a flat table
 st.markdown("""
     <style>
     .stDataFrame div[data-testid="stTable"] { overflow: visible !important; }
@@ -32,17 +33,21 @@ def format_ticker(t):
 
 @st.cache_data(ttl=3600)
 def get_swing_data():
-    # 1. Get Universe ($3 - $10)
+    # 1. Pull a massive universe to ensure we find enough "YES" signals
     try:
         f = Overview()
-        f.set_filter(filters_dict={'Price': '$2 to $10'})
+        # Use a broader filter to catch everything, then refine in Python
+        f.set_filter(filters_dict={'Price': '$2 to $20'}) 
         full = f.screener_view()
-        tickers = full[full['Price'] >= 3]['Ticker'].tolist()
+        # Initial candidate list sorted by volume from the screener
+        tickers = full['Ticker'].tolist()
     except:
-        tickers = ['PLUG', 'NIO', 'MARA']
+        tickers = ['PLUG', 'NIO', 'MARA', 'RIOT', 'F', 'AMD', 'PFE', 'AAL']
 
-    # 2. FORCE DGNX (Bypass Price Filter)
-    if 'DGNX' not in tickers:
+    # 2. FORCE DGNX to the front
+    if 'DGNX' not in tickers: tickers.insert(0, 'DGNX')
+    else:
+        tickers.remove('DGNX')
         tickers.insert(0, 'DGNX')
 
     results = []
@@ -50,22 +55,31 @@ def get_swing_data():
     p = st.progress(0)
     status = st.empty()
 
+    # 3. Deep Scan Logic
+    # We scan until we have enough YES signals or hit a hard limit
     for i, t in enumerate(tickers):
-        if i > 250: break # Higher limit for swing hunting
-        if len(results) >= 25 and yes_count >= 5: break
+        if i > 400: break # Hard scan limit for speed
+        if len(results) >= 50 and yes_count >= 5: break # Collect a pool of 50 to pick top 25 volume
             
-        status.text(f"Scanning Ticker {i}: {t} | Found {yes_count}/5 BUY signals")
+        status.text(f"Searching for BUY signals... Found {yes_count}/5. Scanning: {t}")
         y_ticker = format_ticker(t)
+        
         try:
             s = yf.Ticker(y_ticker)
             h = s.history(period="6mo")
             if h.empty or len(h) < 25: continue
             
             price = h['Close'].iloc[-1]
+            
+            # CRITICAL: Strict Price Filter (except for DGNX)
+            if t != 'DGNX':
+                if not (3.0 <= price <= 10.0):
+                    continue
+
             avg_vol = h['Volume'].tail(60).mean()
             rvol = h['Volume'].iloc[-1] / avg_vol
             
-            # 20-Day Rolling VWAP (The Anchor)
+            # 20-Day Rolling VWAP
             h['TP_Price'] = (h['High'] + h['Low'] + h['Close']) / 3
             h['PV'] = h['TP_Price'] * h['Volume']
             vwap_20 = h['PV'].tail(20).sum() / h['Volume'].tail(20).sum()
@@ -85,16 +99,40 @@ def get_swing_data():
                 '20D VWAP': round(vwap_20, 2), 'RSI': round(rsi, 1), 'RVOL': round(rvol, 2), '60D Avg Vol': int(avg_vol)
             })
         except: continue
-        p.progress(min((i + 1) / 250, 1.0))
+        p.progress(min((i + 1) / 400, 1.0))
         
-    df = pd.DataFrame(results).sort_values(['BUY', '60D Avg Vol'], ascending=[False, False])
+    # 4. Final Processing
+    if not results: return pd.DataFrame()
+    
+    df_pool = pd.DataFrame(results)
+    
+    # Priority 1: All YES signals found
+    yes_df = df_pool[df_pool['BUY'] == "YES"]
+    # Priority 2: DGNX
+    dgnx_df = df_pool[df_pool['Ticker'] == 'DGNX']
+    # Priority 3: The rest (NO signals)
+    no_df = df_pool[df_pool['BUY'] == "NO"]
+    
+    # Combine and prioritize
+    final_combined = pd.concat([yes_df, dgnx_df, no_df]).drop_duplicates(subset=['Ticker'])
+    
+    # Take the top 25 by Volume while keeping the YES signals
+    # We want the most liquid stocks that are also Buys
+    top_25 = final_combined.sort_values(['BUY', '60D Avg Vol'], ascending=[False, False]).head(25)
+    
+    # Final display sort by volume (Descending)
+    top_25 = top_25.sort_values('60D Avg Vol', ascending=False)
+        
     status.empty()
     p.empty()
-    return df.head(25)
+    return top_25
 
 if st.button("🚀 EXECUTE RUTHLESS SWING SCAN"):
     data = get_swing_data()
-    st.dataframe(
-        data.style.map(lambda x: 'background-color: #3498db; color: white;' if x == 'YES' else '', subset=['BUY']),
-        width='stretch', height=1000
-    )
+    if not data.empty:
+        st.dataframe(
+            data.style.map(lambda x: 'background-color: #3498db; color: white;' if x == 'YES' else '', subset=['BUY']),
+            width='stretch', height=1000
+        )
+    else:
+        st.error("No stocks matched the criteria. Try again in a few minutes.")
