@@ -94,4 +94,41 @@ def fetch_and_analyze():
             setup = {
                 'Ticker': ticker, 'BUY': is_buy, 'Entry': round(price, 2),
                 'TP (3.5x)': round(price + (3.5 * atr_14), 2), 'SL (1.5x)': round(price - (1.5 * atr_14), 2),
-                '20
+                '20D VWAP': round(vwap_20, 2), '50D SMA': round(sma_50, 2), 'RSI': round(rsi, 1),
+                'RVOL': round(rvol, 2), '60D Avg Vol': int(df['Volume'].tail(60).mean())
+            }
+
+            if ticker == 'DGNX': dgnx_entry = setup
+            if is_buy == "YES": found_setups.append(setup)
+            
+            time.sleep(0.05) # Pulse delay to prevent server block
+
+        except:
+            continue
+            
+        p_bar.progress(min((i + 1) / len(all_tickers), 1.0))
+
+    status.empty()
+    p_bar.empty()
+    
+    # D. Final Sorting & Merging
+    final_list = found_setups
+    if dgnx_entry and not any(s['Ticker'] == 'DGNX' for s in final_list):
+        final_list.append(dgnx_entry)
+        
+    df_result = pd.DataFrame(final_list)
+    if not df_result.empty:
+        df_result = df_result.sort_values(by=['BUY', 'RVOL'], ascending=[False, False]).head(6)
+    return df_result
+
+# 4. APP EXECUTION
+if st.button("🔍 EXECUTE RUTHLESS SCAN", use_container_width=True):
+    results = fetch_and_analyze()
+    if not results.empty:
+        # Styling: Highlighting the BUY column in Electric Blue
+        st.dataframe(
+            results.style.map(lambda x: 'color: #00FFFF; font-weight: bold;' if x == 'YES' else 'color: white;', subset=['BUY']),
+            width='stretch'
+        )
+    else:
+        st.error("No setups found. The market might be in a cool-down phase.")
