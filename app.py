@@ -1,133 +1,146 @@
 import streamlit as st
+import yfinance as yf
 import pandas as pd
-import numpy as np
-import time
 from finvizfinance.screener.overview import Overview
+import numpy as np
 import warnings
 
-# 1. CONFIG
 warnings.filterwarnings("ignore")
+
 st.set_page_config(page_title="7-14 Day Swing Launchpad", layout="wide")
 
-# 2. UI: HEADER
+# CSS to ensure table expands fully without internal scrollbars
+st.markdown("""
+    <style>
+    .stDataFrame div[data-testid="stTable"] { overflow: visible !important; }
+    .stDataFrame [data-testid="styled-data-frame"] { height: auto !important; }
+    </style>
+    """, unsafe_allow_html=True)
+
+# --- HEADER RULES ---
 st.title("🚀 7-14 Day Swing Launchpad")
+
 st.info("""
-**⚔️ SWING LAWS** | **YES**: All 3 Rules Pass | **MAYBE**: 2 Rules Pass | **DGNX**: Priority Tracking.
+**⚔️ 7-14 DAY SWING LAWS**
+1. **THE TREND:** Price > 20D Rolling VWAP AND 50D SMA.
+2. **THE MOMENTUM:** RSI(14) must be between 45-60 (The Launchpad).
+3. **THE FUEL:** RVOL must be > 1.5 (Institutional Entry).
+4. **THE EXIT:** 3.5x ATR Profit Target / 1.5x ATR Safety Stop.
 """)
 
+def format_ticker(t):
+    return t.replace('-', '.')
+
 def calculate_rsi(series, window=14):
-    try:
-        delta = series.diff()
-        up = delta.clip(lower=0)
-        down = -1 * delta.clip(upper=0)
-        ema_up = up.ewm(com=window-1, adjust=False).mean()
-        ema_down = down.ewm(com=window-1, adjust=False).mean()
-        rs = ema_up / (ema_down + 1e-9)
-        return 100 - (100 / (1 + rs))
-    except: return pd.Series([50] * len(series))
-
-def process_ticker(ticker):
-    """Core logic to fetch and score a single ticker."""
-    try:
-        # Direct Stooq CSV Link
-        url = f"https://stooq.com/q/d/l/?s={ticker.lower()}.us&i=d"
-        df = pd.read_csv(url)
-        if df.empty or len(df) < 60:
-            return None
-
-        df['Date'] = pd.to_datetime(df['Date'])
-        df = df.sort_values('Date')
-
-        # --- Technicals ---
-        price = float(df['Close'].iloc[-1])
-        sma_50 = float(df['Close'].rolling(window=50).mean().iloc[-1])
-        
-        df['TP_Calc'] = (df['High'] + df['Low'] + df['Close']) / 3
-        df['PV'] = df['TP_Calc'] * df['Volume']
-        vwap_20 = float(df['PV'].rolling(window=20).sum().iloc[-1] / (df['Volume'].rolling(window=20).sum().iloc[-1] + 1e-9))
-        
-        rvol = float(df['Volume'].iloc[-1] / (df['Volume'].rolling(window=60).mean().iloc[-1] + 1e-9))
-        rsi_series = calculate_rsi(df['Close'])
-        rsi = float(rsi_series.iloc[-1])
-        
-        tr = pd.concat([df['High'] - df['Low'], (df['High'] - df['Close'].shift()).abs(), (df['Low'] - df['Close'].shift()).abs()], axis=1).max(axis=1)
-        atr_14 = float(tr.rolling(window=14).mean().iloc[-1])
-
-        # --- Scoring ---
-        r1 = 1 if (price > vwap_20 and price > sma_50) else 0
-        r2 = 1 if (45 <= rsi <= 60) else 0
-        r3 = 1 if (rvol > 1.5) else 0
-        score = r1 + r2 + r3
-        
-        signal = "NO"
-        if score == 3: signal = "YES"
-        elif score == 2: signal = "MAYBE"
-        
-        return {
-            'Ticker': ticker, 'SIGNAL': signal, 'Entry': round(price, 2),
-            'TP (3.5x)': round(price + (3.5 * atr_14), 2), 'SL (1.5x)': round(price - (1.5 * atr_14), 2),
-            'RSI': round(rsi, 1), 'RVOL': round(rvol, 2), 'Score': score
-        }
-    except:
-        return None
+    delta = series.diff()
+    up = delta.clip(lower=0)
+    down = -1 * delta.clip(upper=0)
+    ema_up = up.ewm(com=window-1, adjust=False).mean()
+    ema_down = down.ewm(com=window-1, adjust=False).mean()
+    rs = ema_up / (ema_down + 1e-9)
+    return 100 - (100 / (1 + rs))
 
 @st.cache_data(ttl=3600)
-def fetch_and_analyze():
-    cols = ['Ticker', 'SIGNAL', 'Entry', 'TP (3.5x)', 'SL (1.5x)', 'RSI', 'RVOL', 'Score']
-    
-    # --- 1. FORCE DGNX FIRST ---
-    dgnx_data = process_ticker('DGNX')
-    if not dgnx_data:
-        # If Stooq fails, create a placeholder so it ALWAYS shows up
-        dgnx_data = {col: "DATA ERROR" for col in cols}
-        dgnx_data['Ticker'] = 'DGNX'
-        dgnx_data['SIGNAL'] = 'N/A'
-
-    # --- 2. GET REST OF UNIVERSE ---
+def get_swing_data():
+    # 1. Get Universe ($2 to $10 range for optimal swing volatility)
     try:
         f = Overview()
         f.set_filter(filters_dict={'Price': '$2 to $10'})
-        all_tickers = f.screener_view()['Ticker'].tolist()
+        tickers = f.screener_view()['Ticker'].tolist()
     except:
-        all_tickers = []
+        tickers = ['DGNX', 'PLUG', 'NIO', 'F', 'AAL']
+    
+    # 2. FORCE DGNX Priority
+    if 'DGNX' not in tickers:
+        tickers.insert(0, 'DGNX')
+    else:
+        tickers.remove('DGNX')
+        tickers.insert(0, 'DGNX')
 
-    pool = []
-    p_bar = st.progress(0)
+    results = []
+    yes_count = 0
+    p = st.progress(0)
     status = st.empty()
-    scan_limit = 150 # Faster scan to avoid timeouts
-    
-    for i, ticker in enumerate(all_tickers[:scan_limit]):
-        if ticker == 'DGNX': continue
-        status.text(f"🔍 Scanning: {ticker} ({i}/{scan_limit})")
+
+    # 3. Process until we find exactly 5 "YES" signals (plus others up to 25 total)
+    for i, t in enumerate(tickers):
+        if i > 300: break # Safety cap for API limits
+        if yes_count >= 5 and len(results) >= 10: break
+            
+        status.text(f"Scanning Ticker {i}: {t} | Found {yes_count}/5 Launchpad signals")
+        y_ticker = format_ticker(t)
         
-        res = process_ticker(ticker)
-        if res: pool.append(res)
+        try:
+            # Fetch 1 year of daily data for SMA and VWAP accuracy
+            df = yf.download(y_ticker, period="1y", interval="1d", progress=False)
+            if df.empty or len(df) < 60: continue
+            
+            # --- Technical Calculations ---
+            price = float(df['Close'].iloc[-1])
+            
+            # 50D SMA
+            sma_50 = df['Close'].rolling(window=50).mean().iloc[-1]
+            
+            # 20D Rolling VWAP
+            df['TP'] = (df['High'] + df['Low'] + df['Close']) / 3
+            df['PV'] = df['TP'] * df['Volume']
+            vwap_20 = df['PV'].rolling(window=20).sum().iloc[-1] / df['Volume'].rolling(window=20).sum().iloc[-1]
+            
+            # RSI(14)
+            rsi = calculate_rsi(df['Close']).iloc[-1]
+            
+            # RVOL (Current Vol vs 60D Avg)
+            avg_vol_60 = df['Volume'].rolling(window=60).mean().iloc[-1]
+            rvol = df['Volume'].iloc[-1] / avg_vol_60
+            
+            # Swing-Wide ATR(14)
+            high_low = df['High'] - df['Low']
+            high_cp = np.abs(df['High'] - df['Close'].shift())
+            low_cp = np.abs(df['Low'] - df['Close'].shift())
+            tr = pd.concat([high_low, high_cp, low_cp], axis=1).max(axis=1)
+            atr_14 = tr.rolling(window=14).mean().iloc[-1]
+
+            # --- The 7-14 Day Launchpad Logic ---
+            trend_pass = (price > vwap_20) and (price > sma_50)
+            momentum_pass = (45 <= rsi <= 60)
+            fuel_pass = (rvol > 1.5)
+            
+            is_buy = "YES" if (trend_pass and momentum_pass and fuel_pass) else "NO"
+            
+            # DGNX Exception: Force into results even if NO
+            if is_buy == "YES" or t == 'DGNX':
+                if is_buy == "YES": yes_count += 1
+                
+                results.append({
+                    'Ticker': t, 
+                    'BUY': is_buy, 
+                    'Entry': round(price, 2),
+                    'Take Profit (3.5x)': round(price + (3.5 * atr_14), 2), 
+                    'Stop Loss (1.5x)': round(price - (1.5 * atr_14), 2),
+                    'RSI': round(rsi, 1), 
+                    'RVOL': round(rvol, 2), 
+                    '20D VWAP': round(vwap_20, 2),
+                    '50D SMA': round(sma_50, 2),
+                    '60D Avg Vol': int(avg_vol_60)
+                })
+        except: continue
+        p.progress(min((i + 1) / 300, 1.0))
+
+    # Sort results to put BUY signals at top, followed by DGNX
+    df = pd.DataFrame(results)
+    if not df.empty:
+        df = df.sort_values(['BUY', 'RVOL'], ascending=[False, False])
         
-        time.sleep(0.02)
-        p_bar.progress((i + 1) / scan_limit)
+    status.empty()
+    p.empty()
+    return df
 
-    status.empty(); p_bar.empty()
-    
-    # --- 3. ASSEMBLY ---
-    df_pool = pd.DataFrame(pool if pool else [], columns=cols)
-    
-    yes_df = df_pool[df_pool['SIGNAL'] == 'YES'].sort_values('RVOL', ascending=False).head(5)
-    maybe_df = df_pool[df_pool['SIGNAL'] == 'MAYBE'].sort_values('RVOL', ascending=False).head(10)
-    
-    # Create final DF starting with DGNX
-    dgnx_df = pd.DataFrame([dgnx_data])
-    final_results = pd.concat([dgnx_df, yes_df, maybe_df]).reset_index(drop=True)
-    
-    return final_results
-
-# 4. EXECUTION
-if st.button("🔍 EXECUTE RUTHLESS SCAN", use_container_width=True):
-    results = fetch_and_analyze()
-    
-    def style_sig(val):
-        if val == 'YES': return 'color: #00FFFF; font-weight: bold;'
-        if val == 'MAYBE': return 'color: #FFA500; font-weight: bold;'
-        if val == 'N/A' or val == 'DATA ERROR': return 'color: #FF4B4B;'
-        return 'color: white;'
-
-    st.dataframe(results.style.map(style_sig, subset=['SIGNAL']), width='stretch')
+if st.button("🔍 EXECUTE SWING SCAN"):
+    data = get_swing_data()
+    if not data.empty:
+        st.dataframe(
+            data.style.map(lambda x: 'background-color: #2ecc71; color: white;' if x == 'YES' else '', subset=['BUY']),
+            width='stretch', height=600
+        )
+    else:
+        st.warning("No matches found. Market conditions may be too restrictive.")
