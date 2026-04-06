@@ -9,7 +9,7 @@ warnings.filterwarnings("ignore")
 
 st.set_page_config(page_title="7-14 Day Swing Launchpad", layout="wide")
 
-# CSS to ensure table expands fully without internal scrollbars
+# CSS to ensure table expands fully
 st.markdown("""
     <style>
     .stDataFrame div[data-testid="stTable"] { overflow: visible !important; }
@@ -18,14 +18,13 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 # --- HEADER RULES ---
-st.title("🚀 7-14 Day Swing Launchpad")
+st.title("🚀 7-14 Day Swing Launchpad (Tiered)")
 
 st.info("""
 **⚔️ 7-14 DAY SWING LAWS**
-1. **THE TREND:** Price > 20D Rolling VWAP AND 50D SMA.
-2. **THE MOMENTUM:** RSI(14) must be between 45-60 (The Launchpad).
-3. **THE FUEL:** RVOL must be > 1.5 (Institutional Entry).
-4. **THE EXIT:** 3.5x ATR Profit Target / 1.5x ATR Safety Stop.
+1. **YES:** Price > VWAP/SMA **AND** RSI 45-60 **AND** RVOL > 1.5.
+2. **MAYBE:** 2 Rules Pass **AND** 3rd Rule is > 60% of target.
+3. **EXIT:** 3.5x ATR Profit Target / 1.5x ATR Safety Stop.
 """)
 
 def format_ticker(t):
@@ -42,7 +41,6 @@ def calculate_rsi(series, window=14):
 
 @st.cache_data(ttl=3600)
 def get_swing_data():
-    # 1. Get Universe ($2 to $10 range for optimal swing volatility)
     try:
         f = Overview()
         f.set_filter(filters_dict={'Price': '$2 to $10'})
@@ -50,97 +48,102 @@ def get_swing_data():
     except:
         tickers = ['DGNX', 'PLUG', 'NIO', 'F', 'AAL']
     
-    # 2. FORCE DGNX Priority
-    if 'DGNX' not in tickers:
-        tickers.insert(0, 'DGNX')
+    if 'DGNX' not in tickers: tickers.insert(0, 'DGNX')
     else:
-        tickers.remove('DGNX')
-        tickers.insert(0, 'DGNX')
+        tickers.remove('DGNX'); tickers.insert(0, 'DGNX')
 
     results = []
     yes_count = 0
     p = st.progress(0)
     status = st.empty()
 
-    # 3. Process until we find exactly 5 "YES" signals (plus others up to 25 total)
-    for i, t in enumerate(tickers):
-        if i > 300: break # Safety cap for API limits
-        if yes_count >= 5 and len(results) >= 10: break
+    # Process a larger batch to fill the 10 'MAYBE' slots
+    scan_limit = 250 
+    for i, t in enumerate(tickers[:scan_limit]):
+        # Break only if we have our 5 YES and 10 MAYBE (or hit limit)
+        yes_found = [r for r in results if r['BUY'] == 'YES']
+        maybe_found = [r for r in results if r['BUY'] == 'MAYBE']
+        if len(yes_found) >= 5 and len(maybe_found) >= 10: break
             
-        status.text(f"Scanning Ticker {i}: {t} | Found {yes_count}/5 Launchpad signals")
-        y_ticker = format_ticker(t)
+        status.text(f"Scanning {t} ({i}/{scan_limit}) | Found: {len(yes_found)} YES, {len(maybe_found)} MAYBE")
         
         try:
-            # Fetch 1 year of daily data for SMA and VWAP accuracy
-            df = yf.download(y_ticker, period="1y", interval="1d", progress=False)
+            df = yf.download(format_ticker(t), period="1y", interval="1d", progress=False)
             if df.empty or len(df) < 60: continue
             
-            # --- Technical Calculations ---
+            # --- Data Points ---
             price = float(df['Close'].iloc[-1])
-            
-            # 50D SMA
             sma_50 = df['Close'].rolling(window=50).mean().iloc[-1]
-            
-            # 20D Rolling VWAP
             df['TP'] = (df['High'] + df['Low'] + df['Close']) / 3
-            df['PV'] = df['TP'] * df['Volume']
-            vwap_20 = df['PV'].rolling(window=20).sum().iloc[-1] / df['Volume'].rolling(window=20).sum().iloc[-1]
+            vwap_20 = df['TP'].rolling(window=20).sum().iloc[-1] / (df['Volume'].rolling(window=20).sum().iloc[-1] / df['Volume'].rolling(window=20).mean().iloc[-1] * 20) # Simplified proxy for daily roll
+            # Re-calculating actual VWAP logic for better accuracy
+            vwap_20 = (df['TP'] * df['Volume']).rolling(20).sum().iloc[-1] / df['Volume'].rolling(20).sum().iloc[-1]
             
-            # RSI(14)
             rsi = calculate_rsi(df['Close']).iloc[-1]
-            
-            # RVOL (Current Vol vs 60D Avg)
             avg_vol_60 = df['Volume'].rolling(window=60).mean().iloc[-1]
             rvol = df['Volume'].iloc[-1] / avg_vol_60
             
-            # Swing-Wide ATR(14)
-            high_low = df['High'] - df['Low']
-            high_cp = np.abs(df['High'] - df['Close'].shift())
-            low_cp = np.abs(df['Low'] - df['Close'].shift())
-            tr = pd.concat([high_low, high_cp, low_cp], axis=1).max(axis=1)
+            # ATR
+            tr = pd.concat([df['High']-df['Low'], (df['High']-df['Close'].shift()).abs(), (df['Low']-df['Close'].shift()).abs()], axis=1).max(axis=1)
             atr_14 = tr.rolling(window=14).mean().iloc[-1]
 
-            # --- The 7-14 Day Launchpad Logic ---
-            trend_pass = (price > vwap_20) and (price > sma_50)
-            momentum_pass = (45 <= rsi <= 60)
-            fuel_pass = (rvol > 1.5)
+            # --- TIERED LOGIC ---
+            # Define passing conditions
+            c1 = (price > vwap_20 and price > sma_50)
+            c2 = (45 <= rsi <= 60)
+            c3 = (rvol > 1.5)
             
-            is_buy = "YES" if (trend_pass and momentum_pass and fuel_pass) else "NO"
+            # Define "Near Miss" (60% of target)
+            m1 = (price > vwap_20 * 0.98) # Price within 2% of trend
+            m2 = (40 <= rsi <= 65)        # RSI slightly wider
+            m3 = (rvol > 0.9)             # 60% of the 1.5 RVOL target
             
-            # DGNX Exception: Force into results even if NO
-            if is_buy == "YES" or t == 'DGNX':
-                if is_buy == "YES": yes_count += 1
-                
+            conditions = [c1, c2, c3]
+            near_misses = [m1, m2, m3]
+            
+            score = sum(conditions)
+            is_buy = "NO"
+            
+            if score == 3:
+                is_buy = "YES"
+                yes_count += 1
+            elif score == 2:
+                # Check if the 3rd failed condition meets the 60% threshold
+                failed_idx = conditions.index(False)
+                if near_misses[failed_idx]:
+                    is_buy = "MAYBE"
+
+            if is_buy in ["YES", "MAYBE"] or t == 'DGNX':
                 results.append({
-                    'Ticker': t, 
-                    'BUY': is_buy, 
-                    'Entry': round(price, 2),
-                    'Take Profit (3.5x)': round(price + (3.5 * atr_14), 2), 
-                    'Stop Loss (1.5x)': round(price - (1.5 * atr_14), 2),
-                    'RSI': round(rsi, 1), 
-                    'RVOL': round(rvol, 2), 
-                    '20D VWAP': round(vwap_20, 2),
-                    '50D SMA': round(sma_50, 2),
-                    '60D Avg Vol': int(avg_vol_60)
+                    'Ticker': t, 'BUY': is_buy, 'Entry': round(price, 2),
+                    'TP (3.5x)': round(price + (3.5 * atr_14), 2), 
+                    'SL (1.5x)': round(price - (1.5 * atr_14), 2),
+                    'RSI': round(rsi, 1), 'RVOL': round(rvol, 2), 
+                    '20D VWAP': round(vwap_20, 2), '50D SMA': round(sma_50, 2)
                 })
         except: continue
-        p.progress(min((i + 1) / 300, 1.0))
+        p.progress(min((i + 1) / scan_limit, 1.0))
 
-    # Sort results to put BUY signals at top, followed by DGNX
     df = pd.DataFrame(results)
-    if not df.empty:
-        df = df.sort_values(['BUY', 'RVOL'], ascending=[False, False])
-        
-    status.empty()
-    p.empty()
-    return df
+    status.empty(); p.empty()
+    
+    if df.empty: return df
+    
+    # Sort: DGNX first, then YES by RVOL, then MAYBE by RVOL
+    df['Sort'] = df['BUY'].map({'YES': 1, 'MAYBE': 2, 'NO': 3})
+    dgnx = df[df['Ticker'] == 'DGNX']
+    others = df[df['Ticker'] != 'DGNX'].sort_values(['Sort', 'RVOL'], ascending=[True, False])
+    
+    return pd.concat([dgnx, others]).drop(columns=['Sort'])
 
-if st.button("🔍 EXECUTE SWING SCAN"):
+if st.button("🔍 EXECUTE TIERED SCAN"):
     data = get_swing_data()
     if not data.empty:
-        st.dataframe(
-            data.style.map(lambda x: 'background-color: #2ecc71; color: white;' if x == 'YES' else '', subset=['BUY']),
-            width='stretch', height=600
-        )
+        def style_rows(row):
+            if row['BUY'] == 'YES': return ['background-color: #2ecc71; color: white'] * len(row)
+            if row['BUY'] == 'MAYBE': return ['background-color: #f39c12; color: white'] * len(row)
+            return [''] * len(row)
+
+        st.dataframe(data.style.apply(style_rows, axis=1), width='stretch', height=800)
     else:
-        st.warning("No matches found. Market conditions may be too restrictive.")
+        st.warning("No matches found.")
