@@ -2,99 +2,172 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 from finvizfinance.screener.overview import Overview
+import numpy as np
 import warnings
 
+# Quant-level configuration
 warnings.filterwarnings("ignore")
+st.set_page_config(page_title="7-14 Day Swing Launchpad", layout="wide")
 
-st.set_page_config(page_title="High-Prob Swing Pro", layout="wide")
+# UI: CSS for Clean Table & Visual Priority
+st.markdown("""
+    <style>
+    .stDataFrame div[data-testid="stTable"] { overflow: visible !important; }
+    .stDataFrame [data-testid="styled-data-frame"] { height: auto !important; }
+    th { background-color: #1E1E1E !important; color: white !important; }
+    </style>
+    """, unsafe_allow_html=True)
 
-# Sidebar Laws
-st.sidebar.title("⚔️ RUTHLESS SWING LAWS")
-st.sidebar.markdown("""
-**1. TRIPLE THREAT:** Price > 20D VWAP > 50D SMA.
-**2. MOMENTUM:** RSI strictly 45-60.
-**3. LIQUIDITY:** RVOL > 1.5.
-**4. DGNX:** Always included.
+# UI: Header Reminders
+st.title("🚀 7-14 Day Swing Launchpad")
+st.info("""
+**⚔️ 7-14 DAY SWING LAWS**
+1. **THE TREND:** Price > 20D Rolling VWAP (Institutional Floor) AND Price > 50D SMA (Primary Trend).
+2. **THE MOMENTUM:** RSI(14) between 45 and 60 (The "Sweet Spot" before the spike).
+3. **THE FUEL:** RVOL > 1.5 (Evidence of big-money accumulation).
+4. **THE EXIT:** 3.5x ATR Profit Target | 1.5x ATR Safety Stop.
 """)
 
-st.title("📈 High-Probability Swing Analyzer ($3 - $10)")
+def sanitize_ticker(ticker):
+    return ticker.replace('-', '.')
 
-def format_ticker(t):
-    return t.replace('-', '.')
+def calculate_rsi(data, window=14):
+    delta = data.diff()
+    up = delta.clip(lower=0)
+    down = -1 * delta.clip(upper=0)
+    ema_up = up.ewm(com=window-1, adjust=False).mean()
+    ema_down = down.ewm(com=window-1, adjust=False).mean()
+    rs = ema_up / ema_down
+    return 100 - (100 / (1 + rs))
 
 @st.cache_data(ttl=3600)
-def get_swing_data():
+def fetch_launchpad_data():
+    # 1. Pipeline: Pull Universe
     try:
         f = Overview()
-        f.set_filter(filters_dict={'Price': '$2 to $20'}) # Wide pull
-        full = f.screener_view()
-        tickers = full['Ticker'].tolist()
-    except:
-        tickers = ['MARA', 'RIOT', 'PLUG', 'NIO', 'F', 'AMD']
+        f.set_filter(filters_dict={'Price': '$2 to $10'})
+        full_df = f.screener_view()
+        all_tickers = full_df['Ticker'].tolist()
+    except Exception:
+        # Fallback list if Finviz API is throttled
+        all_tickers = ['PLUG', 'NIO', 'MARA', 'RIOT', 'F', 'AMD', 'PFE', 'AAL', 'LCID', 'GRAB']
 
-    # Force DGNX to the front
-    if 'DGNX' not in tickers: tickers.insert(0, 'DGNX')
+    # 2. DGNX Exception: Ensure it's in the queue
+    if 'DGNX' not in all_tickers:
+        all_tickers.insert(0, 'DGNX')
     else:
-        tickers.remove('DGNX'); tickers.insert(0, 'DGNX')
+        all_tickers.remove('DGNX')
+        all_tickers.insert(0, 'DGNX')
 
-    results = []
-    yes_count = 0
-    p = st.progress(0)
+    found_setups = []
+    dgnx_data = None
+    
+    p_bar = st.progress(0)
     status = st.empty()
-
-    for i, t in enumerate(tickers):
-        if i > 500: break # Deep scan to find the best 5 YES
-        if len(results) >= 40 and yes_count >= 5: break
-            
-        status.text(f"Scanning {i}/{len(tickers)}: {t} | High-Prob Signals: {yes_count}/5")
-        y_ticker = format_ticker(t)
+    
+    # 3. Core Algorithm: The Hunt for 5
+    for i, ticker in enumerate(all_tickers):
+        if len(found_setups) >= 5 and dgnx_data is not None:
+            break
+        
+        status.text(f"Scanning Ticker {i}/{len(all_tickers)}: {ticker} | Found: {len(found_setups)}/5")
+        y_ticker = sanitize_ticker(ticker)
         
         try:
-            s = yf.Ticker(y_ticker)
-            h = s.history(period="1y") # 1 year for 50SMA
-            if h.empty or len(h) < 50: continue
-            
-            price = h['Close'].iloc[-1]
-            
-            # STRICT Price Filter (3-10) for everyone but DGNX
-            if t != 'DGNX' and not (3.0 <= price <= 10.0): continue
+            # Fetch 1 year for SMA and VWAP accuracy
+            df = yf.download(y_ticker, period="1y", interval="1d", progress=False)
+            if df.empty or len(df) < 60:
+                continue
 
-            # Calculations
-            h['50SMA'] = h['Close'].rolling(50).mean()
-            h['TP_Price'] = (h['High'] + h['Low'] + h['Close']) / 3
-            h['PV'] = h['TP_Price'] * h['Volume']
-            vwap_20 = h['PV'].tail(20).sum() / h['Volume'].tail(20).sum()
-            avg_vol = h['Volume'].tail(60).mean()
-            rvol = h['Volume'].iloc[-1] / avg_vol
-            tr = (h['High'] - h['Low']).rolling(14).mean().iloc[-1]
+            # --- Technical Engine ---
+            price = df['Close'].iloc[-1]
             
-            delta = h['Close'].diff()
-            rsi = 100 - (100 / (1 + (delta.clip(lower=0).rolling(14).mean() / -delta.clip(upper=0).rolling(14).mean()).iloc[-1]))
-
-            # TIGHTENED RULES
-            sma_50 = h['50SMA'].iloc[-1]
-            is_buy = "YES" if (price > vwap_20 and price > sma_50 and 45 < rsi < 60 and rvol > 1.5) else "NO"
+            # 50-Day SMA
+            sma_50 = df['Close'].rolling(window=50).mean().iloc[-1]
             
-            if is_buy == "YES": yes_count += 1
+            # 20-Day Rolling VWAP
+            # Formula: Sum(P * V) / Sum(V)
+            df['TP'] = (df['High'] + df['Low'] + df['Close']) / 3
+            df['PV'] = df['TP'] * df['Volume']
+            vwap_20 = df['PV'].rolling(window=20).sum().iloc[-1] / df['Volume'].rolling(window=20).sum().iloc[-1]
+            
+            # RVOL (Current Vol / 60D Avg Vol)
+            avg_vol_60 = df['Volume'].rolling(window=60).mean().iloc[-1]
+            rvol = df['Volume'].iloc[-1] / avg_vol_60
+            
+            # RSI(14)
+            rsi = calculate_rsi(df['Close']).iloc[-1]
+            
+            # ATR(14) for Exits
+            high_low = df['High'] - df['Low']
+            high_cp = np.abs(df['High'] - df['Close'].shift())
+            low_cp = np.abs(df['Low'] - df['Close'].shift())
+            tr = pd.concat([high_low, high_cp, low_cp], axis=1).max(axis=1)
+            atr_14 = tr.rolling(window=14).mean().iloc[-1]
 
-            results.append({
-                'Ticker': t, 'BUY': is_buy, 'Price': round(price, 2),
-                'TP': round(price + (3.5 * tr), 2), 'SL': round(price - (1.5 * tr), 2),
-                '20D VWAP': round(vwap_20, 2), '50D SMA': round(sma_50, 2),
-                'RSI': round(rsi, 1), 'RVOL': round(rvol, 2), '60D Avg Vol': int(avg_vol)
-            })
-        except: continue
-        p.progress(min((i + 1) / 500, 1.0))
+            # --- Logic Filters ---
+            trend_pass = (price > vwap_20) and (price > sma_50)
+            momentum_pass = (45 <= rsi <= 60)
+            fuel_pass = (rvol > 1.5)
+            
+            is_buy = "YES" if (trend_pass and momentum_pass and fuel_pass) else "NO"
+            
+            entry_price = round(float(price), 2)
+            setup = {
+                'Ticker': ticker,
+                'BUY (YES)': is_buy,
+                'Entry': entry_price,
+                'Take Profit': round(entry_price + (3.5 * atr_14), 2),
+                'Stop Loss': round(entry_price - (1.5 * atr_14), 2),
+                '20D VWAP': round(float(vwap_20), 2),
+                '50D SMA': round(float(sma_50), 2),
+                'RSI': round(float(rsi), 1),
+                'RVOL': round(float(rvol), 2),
+                '60D Avg Vol': int(avg_vol_60)
+            }
+
+            # Capture DGNX specifically
+            if ticker == 'DGNX':
+                dgnx_data = setup
+            
+            # Add to setups if it's a Launchpad
+            if is_buy == "YES" and len(found_setups) < 5:
+                found_setups.append(setup)
+
+        except Exception:
+            continue
+            
+        p_bar.progress(min((i + 1) / 500, 1.0))
+
+    p_bar.empty()
+    status.empty()
+
+    # 4. Final Compilation
+    # Combine DGNX and the found setups, sort by RVOL
+    final_list = found_setups
+    if dgnx_data and not any(s['Ticker'] == 'DGNX' for s in final_list):
+        final_list.append(dgnx_data)
         
-    df_pool = pd.DataFrame(results)
-    yes_df = df_pool[df_pool['BUY'] == "YES"]
-    dgnx_df = df_pool[df_pool['Ticker'] == 'DGNX']
-    no_df = df_pool[df_pool['BUY'] == "NO"]
-    
-    final_df = pd.concat([yes_df, dgnx_df, no_df]).drop_duplicates(subset=['Ticker']).head(25)
-    status.empty(); p.empty()
-    return final_df.sort_values('60D Avg Vol', ascending=False)
+    res_df = pd.DataFrame(final_list)
+    if not res_df.empty:
+        # Prioritize "YES" signals, then sort by highest RVOL
+        res_df = res_df.sort_values(by=['BUY (YES)', 'RVOL'], ascending=[False, False]).head(6) 
+    return res_df
 
-if st.button("🚀 EXECUTE RUTHLESS SWING SCAN"):
-    data = get_swing_data()
-    st.dataframe(data.style.map(lambda x: 'background-color: #3498db; color: white;' if x == 'YES' else '', subset=['BUY']), width='stretch', height=1000)
+# UI Execution
+if st.button("🔍 SCAN FOR 7-14 DAY SETUPS", width='stretch'):
+    data = fetch_launchpad_data()
+    
+    if not data.empty:
+        # Style logic for Electric Blue Highlighting
+        def color_buy_column(val):
+            color = '#00FFFF' if val == 'YES' else 'white' # Cyan/Electric Blue
+            return f'color: {color}; font-weight: bold;'
+
+        st.dataframe(
+            data.style.map(color_buy_column, subset=['BUY (YES)']),
+            width='stretch',
+            height=400
+        )
+    else:
+        st.warning("The market is currently too volatile or too quiet. No stocks met the Triple-Filter Launchpad criteria.")
