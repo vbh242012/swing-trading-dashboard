@@ -7,16 +7,15 @@ import warnings
 
 # 1. INITIAL CONFIGURATION
 warnings.filterwarnings("ignore")
-st.set_page_config(page_title="7-14 Day Swing Launchpad", layout="wide")
+st.set_page_config(page_title="7-14 Day Tiered Launchpad", layout="wide")
 
 # 2. UI: HEADER & RULES
-st.title("🚀 7-14 Day Swing Launchpad")
+st.title("🚀 7-14 Day Swing Launchpad (Tiered)")
 st.info("""
-**⚔️ RUTHLESS SWING LAWS (7-14 DAY WINDOW)**
-1. **Trend:** Price > 20D Rolling VWAP AND Price > 50D SMA.
-2. **Momentum:** RSI(14) between 45 and 60 (The Launchpad).
-3. **Fuel:** RVOL > 1.5 (Institutional Accumulation).
-4. **Execution:** 5 setups max | Exit: 3.5x ATR Profit / 1.5x ATR Stop.
+**⚔️ SWING SCORING SYSTEM**
+* **YES:** Price > VWAP/SMA **AND** RSI 45-60 **AND** RVOL > 1.5.
+* **MAYBE:** Price > VWAP/SMA **AND** (Either RSI 45-60 OR RVOL > 1.5).
+* **DGNX:** Always displayed for tracking.
 """)
 
 # 3. TECHNICAL UTILITIES
@@ -31,41 +30,34 @@ def calculate_rsi(series, window=14):
 
 @st.cache_data(ttl=3600)
 def fetch_and_analyze():
-    # A. Get Universe from Finviz ($2 - $10)
     try:
         f = Overview()
         f.set_filter(filters_dict={'Price': '$2 to $10'})
         all_tickers = f.screener_view()['Ticker'].tolist()
     except:
-        all_tickers = ['PLUG', 'NIO', 'MARA', 'RIOT', 'F', 'AMD'] # Emergency fallback
+        all_tickers = ['PLUG', 'NIO', 'MARA', 'RIOT', 'F', 'AMD']
 
-    # B. DGNX Priority Injection
+    # DGNX Priority
     if 'DGNX' not in all_tickers: all_tickers.insert(0, 'DGNX')
     else:
-        all_tickers.remove('DGNX')
-        all_tickers.insert(0, 'DGNX')
+        all_tickers.remove('DGNX'); all_tickers.insert(0, 'DGNX')
 
-    found_setups = []
+    pool = []
     dgnx_entry = None
     p_bar = st.progress(0)
     status = st.empty()
     
-    # C. Processing Loop
-    for i, ticker in enumerate(all_tickers):
-        if len(found_setups) >= 5 and dgnx_entry is not None:
-            break
-        
-        status.text(f"Scanning Ticker {i}/{len(all_tickers)}: {ticker} | Found: {len(found_setups)}/5")
+    # We scan a larger chunk to ensure we fill the "Maybe" slots
+    scan_limit = 300 
+    
+    for i, ticker in enumerate(all_tickers[:scan_limit]):
+        status.text(f"Scanning Ticker {i}/{scan_limit}: {ticker} | Pool Size: {len(pool)}")
         
         try:
-            # DIRECT STOOQ FETCH (CSV Bypass for Rate Limits)
             url = f"https://stooq.com/q/d/l/?s={ticker.lower()}.us&i=d"
             df = pd.read_csv(url)
-            
-            if df.empty or len(df) < 60:
-                continue
+            if df.empty or len(df) < 60: continue
 
-            # Data Cleaning
             df['Date'] = pd.to_datetime(df['Date'])
             df = df.sort_values('Date')
 
@@ -73,62 +65,70 @@ def fetch_and_analyze():
             price = float(df['Close'].iloc[-1])
             sma_50 = float(df['Close'].rolling(window=50).mean().iloc[-1])
             
-            # 20D VWAP Calculation
             df['TP'] = (df['High'] + df['Low'] + df['Close']) / 3
             df['PV'] = df['TP'] * df['Volume']
             vwap_20 = float(df['PV'].rolling(window=20).sum().iloc[-1] / df['Volume'].rolling(window=20).sum().iloc[-1])
             
-            # RSI & RVOL
             rvol = float(df['Volume'].iloc[-1] / df['Volume'].rolling(window=60).mean().iloc[-1])
             rsi = float(calculate_rsi(df['Close']).iloc[-1])
             
-            # ATR(14) for Stop/Target
-            tr = pd.concat([df['High'] - df['Low'], 
-                            (df['High'] - df['Close'].shift()).abs(), 
-                            (df['Low'] - df['Close'].shift()).abs()], axis=1).max(axis=1)
+            tr = pd.concat([df['High'] - df['Low'], (df['High'] - df['Close'].shift()).abs(), (df['Low'] - df['Close'].shift()).abs()], axis=1).max(axis=1)
             atr_14 = float(tr.rolling(window=14).mean().iloc[-1])
 
-            # --- The Launchpad Logic ---
-            is_buy = "YES" if (price > vwap_20 and price > sma_50 and 45 <= rsi <= 60 and rvol > 1.5) else "NO"
+            # --- Tiered Logic ---
+            rule_trend = (price > vwap_20 and price > sma_50)
+            rule_mom = (45 <= rsi <= 60)
+            rule_fuel = (rvol > 1.5)
+            
+            # Scoring
+            score = sum([rule_trend, rule_mom, rule_fuel])
+            
+            signal = "NO"
+            if score == 3: signal = "YES"
+            elif score == 2: signal = "MAYBE"
             
             setup = {
-                'Ticker': ticker, 'BUY': is_buy, 'Entry': round(price, 2),
+                'Ticker': ticker, 'SIGNAL': signal, 'Entry': round(price, 2),
                 'TP (3.5x)': round(price + (3.5 * atr_14), 2), 'SL (1.5x)': round(price - (1.5 * atr_14), 2),
-                '20D VWAP': round(vwap_20, 2), '50D SMA': round(sma_50, 2), 'RSI': round(rsi, 1),
-                'RVOL': round(rvol, 2), '60D Avg Vol': int(df['Volume'].tail(60).mean())
+                'RSI': round(rsi, 1), 'RVOL': round(rvol, 2), 'Score': score
             }
 
             if ticker == 'DGNX': dgnx_entry = setup
-            if is_buy == "YES": found_setups.append(setup)
+            else: pool.append(setup)
             
-            time.sleep(0.05) # Pulse delay to prevent server block
+            time.sleep(0.05)
 
-        except:
-            continue
-            
-        p_bar.progress(min((i + 1) / len(all_tickers), 1.0))
+        except: continue
+        p_bar.progress((i + 1) / scan_limit)
 
-    status.empty()
-    p_bar.empty()
+    status.empty(); p_bar.empty()
     
-    # D. Final Sorting & Merging
-    final_list = found_setups
-    if dgnx_entry and not any(s['Ticker'] == 'DGNX' for s in final_list):
-        final_list.append(dgnx_entry)
+    # Sorting Logic:
+    # 1. YES signals first
+    # 2. MAYBE signals second
+    # 3. Sort both by RVOL descending
+    df_all = pd.DataFrame(pool)
+    
+    yes_df = df_all[df_all['SIGNAL'] == 'YES'].sort_values('RVOL', ascending=False).head(5)
+    maybe_df = df_all[df_all['SIGNAL'] == 'MAYBE'].sort_values('RVOL', ascending=False).head(10)
+    
+    # Merge and add DGNX
+    final_results = pd.concat([yes_df, maybe_df])
+    if dgnx_entry:
+        dgnx_df = pd.DataFrame([dgnx_entry])
+        final_results = pd.concat([dgnx_df, final_results]).drop_duplicates(subset='Ticker')
         
-    df_result = pd.DataFrame(final_list)
-    if not df_result.empty:
-        df_result = df_result.sort_values(by=['BUY', 'RVOL'], ascending=[False, False]).head(6)
-    return df_result
+    return final_results
 
 # 4. APP EXECUTION
-if st.button("🔍 EXECUTE RUTHLESS SCAN", use_container_width=True):
+if st.button("🔍 EXECUTE TIERED SCAN", use_container_width=True):
     results = fetch_and_analyze()
     if not results.empty:
-        # Styling: Highlighting the BUY column in Electric Blue
-        st.dataframe(
-            results.style.map(lambda x: 'color: #00FFFF; font-weight: bold;' if x == 'YES' else 'color: white;', subset=['BUY']),
-            width='stretch'
-        )
+        def color_signal(val):
+            if val == 'YES': return 'color: #00FFFF; font-weight: bold;'
+            if val == 'MAYBE': return 'color: #FFA500; font-weight: bold;' # Orange
+            return 'color: white;'
+
+        st.dataframe(results.style.map(color_signal, subset=['SIGNAL']), width='stretch')
     else:
-        st.error("No setups found. The market might be in a cool-down phase.")
+        st.error("Connection error. Try again in 60 seconds.")
